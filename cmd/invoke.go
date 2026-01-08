@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -37,7 +38,9 @@ var invocationHistoryCmd = &cobra.Command{
 func init() {
 	invokeCmd.Flags().StringP("version", "v", "latest", "Specify a version of the app to invoke (optional, defaults to 'latest')")
 	invokeCmd.Flags().StringP("payload", "p", "", "JSON payload for the invocation (optional)")
+	invokeCmd.Flags().StringP("payload-file", "f", "", "Path to a JSON file containing the payload (use '-' for stdin)")
 	invokeCmd.Flags().BoolP("sync", "s", false, "Invoke synchronously (default false). A synchronous invocation will open a long-lived HTTP POST to the Kernel API to wait for the invocation to complete. This will time out after 60 seconds, so only use this option if you expect your invocation to complete in less than 60 seconds. The default is to invoke asynchronously, in which case the CLI will open an SSE connection to the Kernel API after submitting the invocation and wait for the invocation to complete.")
+	invokeCmd.MarkFlagsMutuallyExclusive("payload", "payload-file")
 
 	invocationHistoryCmd.Flags().Int("limit", 100, "Max invocations to return (default 100)")
 	invocationHistoryCmd.Flags().StringP("app", "a", "", "Filter by app name")
@@ -65,15 +68,11 @@ func runInvoke(cmd *cobra.Command, args []string) error {
 		Async:      kernel.Opt(!isSync),
 	}
 
-	payloadStr, _ := cmd.Flags().GetString("payload")
-	if cmd.Flags().Changed("payload") {
-		// validate JSON unless empty string explicitly set
-		if payloadStr != "" {
-			var v interface{}
-			if err := json.Unmarshal([]byte(payloadStr), &v); err != nil {
-				return fmt.Errorf("invalid JSON payload: %w", err)
-			}
-		}
+	payloadStr, hasPayload, err := getPayload(cmd)
+	if err != nil {
+		return err
+	}
+	if hasPayload {
 		params.Payload = kernel.Opt(payloadStr)
 	}
 	// we don't really care to cancel the context, we just want to handle signals
@@ -216,6 +215,58 @@ func printResult(success bool, output string) {
 	} else {
 		pterm.Error.Printf("Result:\n%s\n", output)
 	}
+}
+
+// getPayload reads the payload from either --payload flag or --payload-file flag.
+// Returns the payload string, whether a payload was explicitly provided, and any error.
+// The second return value (hasPayload) is true when the user explicitly set a payload,
+// even if that payload is an empty string.
+func getPayload(cmd *cobra.Command) (payload string, hasPayload bool, err error) {
+	payloadStr, _ := cmd.Flags().GetString("payload")
+	payloadFile, _ := cmd.Flags().GetString("payload-file")
+
+	// If --payload was explicitly set, use it (even if empty string)
+	if cmd.Flags().Changed("payload") {
+		// Validate JSON unless empty string explicitly set
+		if payloadStr != "" {
+			var v interface{}
+			if err := json.Unmarshal([]byte(payloadStr), &v); err != nil {
+				return "", false, fmt.Errorf("invalid JSON payload: %w", err)
+			}
+		}
+		return payloadStr, true, nil
+	}
+
+	// If --payload-file was set, read from file
+	if cmd.Flags().Changed("payload-file") {
+		var data []byte
+
+		if payloadFile == "-" {
+			// Read from stdin
+			data, err = io.ReadAll(os.Stdin)
+			if err != nil {
+				return "", false, fmt.Errorf("failed to read payload from stdin: %w", err)
+			}
+		} else {
+			// Read from file
+			data, err = os.ReadFile(payloadFile)
+			if err != nil {
+				return "", false, fmt.Errorf("failed to read payload file: %w", err)
+			}
+		}
+
+		payloadStr = strings.TrimSpace(string(data))
+		// Validate JSON unless empty
+		if payloadStr != "" {
+			var v interface{}
+			if err := json.Unmarshal([]byte(payloadStr), &v); err != nil {
+				return "", false, fmt.Errorf("invalid JSON in payload file: %w", err)
+			}
+		}
+		return payloadStr, true, nil
+	}
+
+	return "", false, nil
 }
 
 func runInvocationHistory(cmd *cobra.Command, args []string) error {
