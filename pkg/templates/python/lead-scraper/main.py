@@ -25,7 +25,7 @@ app = kernel.App("lead-scraper")
 
 # LLM for the browser-use agent
 # API key is set via: kernel deploy main.py -e OPENAI_API_KEY=XXX
-llm = ChatOpenAI(model="gpt-4o")
+llm = ChatOpenAI(model="gpt-4.1")
 
 # ============================================================================
 # SCRAPER PROMPT
