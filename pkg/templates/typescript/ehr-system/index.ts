@@ -10,6 +10,7 @@ interface Input {
 interface Output {
   elapsed: number;
   answer: string | null;
+  download?: string | null;
   logs?: any[];
 }
 
@@ -54,6 +55,11 @@ app.action<Input, Output>(
         },
       });
 
+      console.log('Starting download listener...');
+      // Start listening for download before running the agent
+      // Set a long timeout (5 minutes) because the agent might take time to navigate
+      const downloadPromise = (computer as any).waitForDownload(300000);
+      
       // run agent and get response
       const logs = await agent.runFullTurn({
         messages: [
@@ -71,6 +77,19 @@ app.action<Input, Output>(
         debug: true,
         show_images: false,
       });
+
+      // Wait for download to resolve (it should have happened during the run)
+      // We use a small timeout race just in case it's still pending but not happening
+      const download = await Promise.race([
+        downloadPromise,
+        new Promise<null>(resolve => setTimeout(() => resolve(null), 5000))
+      ]);
+
+      if (download) {
+        console.log(`Download captured: ${download}`);
+      } else {
+        console.log('No download captured within timeout.');
+      }
 
       const elapsed = parseFloat(((Date.now() - start) / 1000).toFixed(2));
 
@@ -91,6 +110,7 @@ app.action<Input, Output>(
       return {
         elapsed,
         answer,
+        download
       };
     } catch (error) {
       const elapsed = parseFloat(((Date.now() - start) / 1000).toFixed(2));

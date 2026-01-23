@@ -239,4 +239,15 @@ export class BasePlaywrightComputer {
     this._assertPage();
     return (await this._page.goForward()) || null;
   };
+  waitForDownload = async (timeout = 30000): Promise<string | null> => {
+    this._assertPage();
+    try {
+      const downloadPromise = this._page.waitForEvent('download', { timeout });
+      const download = await downloadPromise;
+      return await download.url();
+    } catch (e) {
+      console.error('Download capture failed:', e);
+      return null;
+    }
+  };
 }
