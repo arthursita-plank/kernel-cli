@@ -1,13 +1,13 @@
 """
-Generic Lead Scraper - Kernel Template
+Generic Lead Scraper - Kernel Template (Anthropic Computer Use)
 
-This template demonstrates how to build a flexible lead scraper using browser-use.
+This template demonstrates how to build a flexible lead scraper using Anthropic Computer Use.
 Pass in any website URL and describe what data to extract - the agent will
 navigate the site and return leads as a downloadable CSV.
 
 Usage:
-    kernel deploy main.py -e OPENAI_API_KEY=$OPENAI_API_KEY
-    kernel invoke lead-scraper scrape-leads --data '{
+    kernel deploy main.py -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
+    kernel invoke lead-scraper scrape-leads --payload '{
         "url": "https://example.com/directory",
         "instructions": "Find all company listings. For each, extract: company name, email, phone, website.",
         "max_results": 10
@@ -17,11 +17,13 @@ Usage:
 import csv
 import io
 import json
+import os
+from typing import Dict
 
 import kernel
-from browser_use import Agent, Browser
-from browser_use.llm import ChatOpenAI
 from kernel import Kernel
+from loop import sampling_loop
+from session import KernelBrowserSession
 
 from models import ScrapeInput, ScrapeOutput
 
@@ -29,13 +31,13 @@ from models import ScrapeInput, ScrapeOutput
 # CONFIGURATION
 # ============================================================================
 
-# Initialize Kernel client and app
-client = Kernel()
+# Initialize Kernel app
 app = kernel.App("lead-scraper")
 
-# LLM for the browser-use agent
-# API key is set via: kernel deploy main.py -e OPENAI_API_KEY=XXX
-llm = ChatOpenAI(model="gpt-4o")
+# API key is set via: kernel deploy main.py -e ANTHROPIC_API_KEY=XXX
+api_key = os.getenv("ANTHROPIC_API_KEY")
+if not api_key:
+    raise ValueError("ANTHROPIC_API_KEY is not set")
 
 
 # ============================================================================
@@ -94,7 +96,7 @@ C) Check links that often hide data:
    - tel: links for phone
    - profile/firm website links
 
-D) If the site has multiple sections/tabs (e.g., “Contact”, “Details”), click them.
+D) If the site has multiple sections/tabs (e.g., "Contact", "Details"), click them.
 
 ====================
 LEAD LOOP
@@ -120,18 +122,7 @@ OUTPUT SHAPE
 ABSOLUTE REQUIREMENT
 ====================
 
-Return ONLY the JSON array of leads.
-"""
-
-# ============================================================================
-# LLM SYSTEM PROMPT TEMPLATE
-# ============================================================================
-LLM_SYSTEM = """
-DATA INTEGRITY (HIGHEST PRIORITY):
-- Never overwrite a non-empty field with null/None/"".
-- The extract tool only ADDs data. If extract says "unavailable", that means "no new info on this page" — keep existing values.
-- Only set a field to null if the page explicitly shows N/A / Not provided / — for that field.
-- When trying to capture email/phone/website, always consider link hrefs (mailto:, tel:, http).
+Return ONLY the JSON array of leads as your final response.
 """
 
 
@@ -164,89 +155,119 @@ async def scrape_leads(ctx: kernel.KernelContext, input_data: dict) -> dict:
     print(f"Instructions: {scrape_input.instructions[:100]}...")
     print(f"Target: {scrape_input.max_results} leads")
 
-    # Create Kernel browser session
-    kernel_browser = None
-
     try:
-        kernel_browser = client.browsers.create(
-            invocation_id=ctx.invocation_id,
-            stealth=True,  # Use stealth mode to avoid detection
-        )
-        print(f"Browser live view: {kernel_browser.browser_live_view_url}")
+        async with KernelBrowserSession(
+            stealth=True,
+            record_replay=False,
+        ) as session:
+            print(f"Browser live view: {session.live_view_url}")
 
-        # Connect browser-use to the Kernel browser
-        browser = Browser(
-            cdp_url=kernel_browser.cdp_ws_url,
-            headless=False,
-            window_size={"width": 1920, "height": 1080},
-            viewport={"width": 1920, "height": 1080},
-            device_scale_factor=1.0,
-            minimum_wait_page_load_time=1.5,
-            wait_for_network_idle_page_load_time=1.7,
-        )
+            # Run the Anthropic Computer Use sampling loop
+            final_messages = await sampling_loop(
+                model="claude-sonnet-4-5-20250929",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": task_prompt,
+                    }
+                ],
+                api_key=str(api_key),
+                thinking_budget=1024,
+                kernel=session.kernel,
+                session_id=session.session_id,
+            )
 
-        # Create and run the browser-use agent
-        agent = Agent(
-            task=task_prompt,
-            llm=llm,
-            browser=browser,
-            extend_system_message=LLM_SYSTEM,
-            include_attributes=["href"],
-            use_vision=True,
-        )
+            if not final_messages:
+                raise ValueError("No messages were generated during the sampling loop")
 
-        print("Running browser-use agent...")
-        result = await agent.run()
+            # Extract the final result from the last message
+            last_message = final_messages[-1]
+            if not last_message:
+                raise ValueError("Failed to get the last message from the sampling loop")
 
-        # Parse results - try final_result first, then fall back to history if needed
-        leads_data = []
-        final_text = result.final_result()
+            final_text = ""
+            if isinstance(last_message.get("content"), str):
+                final_text = last_message["content"]
+            else:
+                final_text = "".join(
+                    block["text"]
+                    for block in last_message["content"]
+                    if isinstance(block, Dict) and block.get("type") == "text"
+                )
 
-        # If strict judge failed but we have data in history, try to find it
-        if not final_text:
-            print("No final result found. Checking history for data...")
-            for action in result.action_results():
-                if action.extracted_content and "[" in action.extracted_content:
-                    final_text = action.extracted_content
-                    break
+            # Parse results
+            leads_data = []
+            
+            if final_text:
+                print(f"Parsing final result ({len(final_text)} chars)...")
+                leads_data = parse_leads_from_result(final_text)
 
-        if final_text:
-            print(f"Parsing final_result ({len(final_text)} chars)...")
-            try:
-                # Basic cleanup if the LLM wraps code in markdown
-                cleaned_text = final_text.replace("```json", "").replace("```", "").strip()
-                
-                # Find the JSON array in the response
-                start_idx = cleaned_text.find("[")
-                end_idx = cleaned_text.rfind("]") + 1
-                
-                if start_idx != -1 and end_idx > start_idx:
-                    json_text = cleaned_text[start_idx:end_idx]
-                    data = json.loads(json_text)
+            # If no leads from final message, search through all messages
+            if not leads_data:
+                print("No leads in final message. Searching message history...")
+                for msg in reversed(final_messages):
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and "[" in content:
+                        leads_data = parse_leads_from_result(content)
+                        if leads_data:
+                            break
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text = block.get("text", "")
+                                if "[" in text:
+                                    leads_data = parse_leads_from_result(text)
+                                    if leads_data:
+                                        break
+                        if leads_data:
+                            break
 
-                    if isinstance(data, list):
-                        leads_data = data
-            except json.JSONDecodeError as e:
-                print(f"Failed to parse JSON result: {e}")
-                print("Raw result:", final_text[:500])
+            print(f"Successfully extracted {len(leads_data)} leads")
 
-        print(f"Successfully extracted {len(leads_data)} leads")
+            # Generate CSV with dynamic columns
+            csv_string = generate_csv(leads_data)
 
-        # Generate CSV with dynamic columns
-        csv_string = generate_csv(leads_data)
+            result_output = ScrapeOutput(
+                leads=leads_data,
+                total_found=len(leads_data),
+                csv_data=csv_string
+            )
+            return result_output.model_dump()
 
-        result_output = ScrapeOutput(
-            leads=leads_data,
-            total_found=len(leads_data),
-            csv_data=csv_string
-        )
-        return result_output.model_dump()
+    except Exception as e:
+        print(f"Error during scraping: {e}")
+        raise
 
-    finally:
-        # Always clean up the browser session
-        if kernel_browser is not None:
-            client.browsers.delete_by_id(kernel_browser.session_id)
-            print("Browser session cleaned up")
+
+def parse_leads_from_result(text: str) -> list:
+    """
+    Parse leads JSON array from text response.
+    
+    Args:
+        text: Raw text that may contain a JSON array of leads
+        
+    Returns:
+        List of lead dictionaries, or empty list if parsing fails
+    """
+    try:
+        # Basic cleanup if the LLM wraps code in markdown
+        cleaned_text = text.replace("```json", "").replace("```", "").strip()
+        
+        # Find the JSON array in the response
+        start_idx = cleaned_text.find("[")
+        end_idx = cleaned_text.rfind("]") + 1
+        
+        if start_idx != -1 and end_idx > start_idx:
+            json_text = cleaned_text[start_idx:end_idx]
+            data = json.loads(json_text)
+
+            if isinstance(data, list):
+                return data
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse JSON result: {e}")
+        print("Raw text:", text[:500])
+    
+    return []
 
 
 def generate_csv(leads: list) -> str:
